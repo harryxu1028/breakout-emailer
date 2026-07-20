@@ -1,17 +1,18 @@
 """
-Breakout Emailer
-----------------
-Scans sector watchlists for stocks that made a FRESH 3-year high yesterday
-(yesterday's close broke above the trailing 3y max; the day before did not),
-then emails a report with each name grouped by sector and a 5-year price
-chart under each ticker (or full history since IPO if shorter).
+Breakout Emailer — sector-wide edition
+--------------------------------------
+Pulls ALL US-listed equities in the configured Yahoo Finance sectors
+(via yfinance's screener API), scans for stocks that made a FRESH
+3-year high yesterday, and emails a report: names grouped by sector,
+each with ticker, company name, stats, and a 5-year price chart
+inline in the email body (full history since IPO if shorter).
 
 Sends nothing if there are no breakouts.
 
-Env vars required (set as GitHub Actions secrets or locally):
+Env vars required:
   EMAIL_FROM          sender address (e.g. yourname@gmail.com)
   EMAIL_TO            recipient address
-  GMAIL_APP_PASSWORD  Gmail app password (Google Account > Security > App passwords)
+  GMAIL_APP_PASSWORD  Gmail app password
 
 Usage:
   pip install yfinance pandas matplotlib
@@ -32,69 +33,144 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
 import yfinance as yf
+from yfinance import EquityQuery
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SECTORS = {
-    "Software": ["CRM", "NOW", "HUBS", "MNDY", "PCOR"],
-    "Payments/Fintech": ["FI", "FOUR", "AFRM", "TOST", "FLYW"],
-    "Semis/Memory": ["SNDK", "MU", "WDC", "MRVL", "STX"],
-    "Internet": ["SE", "CPNG", "RBLX", "DUOL", "SHOP"],
-}
+# Yahoo Finance sector names (exact strings). Valid options:
+#   "Technology", "Financial Services", "Communication Services",
+#   "Consumer Cyclical", "Consumer Defensive", "Healthcare",
+#   "Industrials", "Energy", "Basic Materials", "Real Estate", "Utilities"
+SECTORS = [
+    "Technology",
+    "Financial Services",
+    "Communication Services",
+    "Consumer Cyclical",
+]
 
-LOOKBACK = 756           # ~3 years of trading days for the high test
-MIN_HISTORY = 600        # min trading days to qualify for the breakout test
-CHART_YEARS = 5          # chart window (falls back to full history if shorter)
-USE_INTRADAY_HIGH = False  # True = test against 3y max of daily HIGHS
-SEND_IF_EMPTY = False    # True = send a "no breakouts" email anyway
+REGION = "us"                    # listing region filter
+MIN_MARKET_CAP = 300_000_000     # $300M floor; set to 0 for truly everything
+MAX_NAMES_PER_SECTOR = 2000      # hard safety cap per sector
+
+LOOKBACK = 756                   # ~3 years of trading days for the high test
+MIN_HISTORY = 600                # min trading days to qualify
+CHART_YEARS = 5                  # chart window (full history if shorter)
+USE_INTRADAY_HIGH = False        # True = test against 3y max of daily HIGHS
+SEND_IF_EMPTY = False            # True = send a "no breakouts" email anyway
+
+MAX_CHARTS = 40                  # cap inline charts per email (Gmail clips
+                                 # huge messages); overflow listed as text
+DOWNLOAD_CHUNK = 200             # tickers per yf.download batch
 
 SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 465
+PAGE = 250                       # Yahoo screener max page size
 
 
 # ---------------------------------------------------------------------------
-# Company names (looked up only for hits, so at most a handful of requests)
+# Universe: enumerate every ticker Yahoo classifies in each sector
 # ---------------------------------------------------------------------------
-def get_company_name(ticker: str) -> str:
-    try:
-        info = yf.Ticker(ticker).info
-        return info.get("shortName") or info.get("longName") or ticker
-    except Exception:
-        return ticker
+def build_universe() -> dict[str, dict]:
+    """Returns {ticker: {"sector": ..., "name": ...}} across all SECTORS."""
+    universe: dict[str, dict] = {}
+    for sector in SECTORS:
+        clauses = [
+            EquityQuery("eq", ["sector", sector]),
+            EquityQuery("eq", ["region", REGION]),
+        ]
+        if MIN_MARKET_CAP > 0:
+            clauses.append(
+                EquityQuery("gte", ["intradaymarketcap", MIN_MARKET_CAP])
+            )
+        query = EquityQuery("and", clauses)
+
+        offset, total, fetched = 0, None, 0
+        while True:
+            try:
+                res = yf.screen(
+                    query, size=PAGE, offset=offset,
+                    sortField="intradaymarketcap", sortAsc=False,
+                )
+            except Exception as e:
+                print(f"[warn] screener page failed "
+                      f"({sector} offset {offset}): {e}")
+                break
+
+            quotes = res.get("quotes", []) if res else []
+            if total is None:
+                total = res.get("total", 0)
+                print(f"{sector}: {total} names pass filters")
+            if not quotes:
+                break
+
+            for q in quotes:
+                sym = q.get("symbol")
+                if not sym or "." in sym or "^" in sym:
+                    continue  # skip odd share classes / indices
+                universe.setdefault(sym, {
+                    "sector": sector,
+                    "name": q.get("shortName")
+                            or q.get("longName") or sym,
+                })
+            fetched += len(quotes)
+            offset += PAGE
+            if fetched >= min(total, MAX_NAMES_PER_SECTOR):
+                break
+    print(f"Universe: {len(universe)} unique tickers "
+          f"across {len(SECTORS)} sectors")
+    return universe
+
+
+# ---------------------------------------------------------------------------
+# Prices: chunked batch download
+# ---------------------------------------------------------------------------
+def download_prices(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    closes, highs = [], []
+    for i in range(0, len(tickers), DOWNLOAD_CHUNK):
+        chunk = tickers[i:i + DOWNLOAD_CHUNK]
+        px = yf.download(chunk, period="6y", auto_adjust=True,
+                         progress=False, threads=True)
+        c, h = px["Close"], px["High"]
+        if isinstance(c, pd.Series):  # single-ticker chunk edge case
+            c, h = c.to_frame(chunk[0]), h.to_frame(chunk[0])
+        closes.append(c)
+        highs.append(h)
+        print(f"  downloaded {min(i + DOWNLOAD_CHUNK, len(tickers))}"
+              f"/{len(tickers)}")
+    return (pd.concat(closes, axis=1),
+            pd.concat(highs, axis=1))
 
 
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
-def find_breakouts(px: pd.DataFrame, tickers: list[str]) -> list[dict]:
-    closes = px["Close"]
-    ref = px["High"] if USE_INTRADAY_HIGH else px["Close"]
-    if isinstance(closes, pd.Series):
-        closes, ref = closes.to_frame(tickers[0]), ref.to_frame(tickers[0])
-
+def find_breakouts(closes: pd.DataFrame, highs: pd.DataFrame,
+                   universe: dict[str, dict]) -> list[dict]:
+    ref_df = highs if USE_INTRADAY_HIGH else closes
     hits = []
-    for t in tickers:
+    for t, meta in universe.items():
+        if t not in closes.columns:
+            continue
         s_close = closes[t].dropna()
-        s_ref = ref[t].dropna()
+        s_ref = ref_df[t].dropna()
         if len(s_close) < MIN_HISTORY + 2:
             continue
 
         y_close = s_close.iloc[-1]                        # yesterday
-        prior_max_y = s_ref.iloc[-1 - LOOKBACK:-1].max()  # 3y max excl. yesterday
+        prior_max_y = s_ref.iloc[-1 - LOOKBACK:-1].max()  # 3y max excl. yday
         d2_close = s_close.iloc[-2]
         prior_max_d2 = s_ref.iloc[-2 - LOOKBACK:-2].max()
 
         if y_close > prior_max_y and d2_close <= prior_max_d2:
-            sector = next(sec for sec, lst in SECTORS.items() if t in lst)
             hits.append({
                 "ticker": t,
-                "name": get_company_name(t),
-                "sector": sector,
+                "name": meta["name"],
+                "sector": meta["sector"],
                 "close": y_close,
                 "prior_3y_high": prior_max_y,
                 "breakout_pct": (y_close / prior_max_y - 1) * 100,
                 "date": s_close.index[-1].date().isoformat(),
-                "series": s_close,  # reused for charting
+                "series": s_close,
             })
     return hits
 
@@ -136,7 +212,8 @@ def make_chart_png(hit: dict) -> bytes:
 # Email assembly
 # ---------------------------------------------------------------------------
 def build_email(hits: list[dict]) -> MIMEMultipart:
-    date_str = hits[0]["date"] if hits else pd.Timestamp.today().date().isoformat()
+    date_str = hits[0]["date"] if hits else \
+        pd.Timestamp.today().date().isoformat()
     msg = MIMEMultipart("related")
     msg["Subject"] = (
         f"Breakout Scan {date_str}: {len(hits)} fresh 3y high(s)"
@@ -146,10 +223,12 @@ def build_email(hits: list[dict]) -> MIMEMultipart:
     msg["To"] = os.environ["EMAIL_TO"]
 
     parts = [
-        "<html><body style='font-family:Arial,Helvetica,sans-serif;color:#222;'>",
-        f"<h2 style='margin-bottom:2px;'>Fresh 3-Year-High Breakouts</h2>",
+        "<html><body style='font-family:Arial,Helvetica,sans-serif;"
+        "color:#222;'>",
+        "<h2 style='margin-bottom:2px;'>Fresh 3-Year-High Breakouts</h2>",
         f"<p style='color:#666;margin-top:0;'>As of close {date_str}</p>",
     ]
+    images = []
 
     if not hits:
         parts.append("<p>No fresh breakouts today.</p>")
@@ -159,7 +238,7 @@ def build_email(hits: list[dict]) -> MIMEMultipart:
             by_sector.setdefault(h["sector"], []).append(h)
 
         img_idx = 0
-        images = []
+        overflow: list[dict] = []
         for sector in SECTORS:  # preserve config order
             if sector not in by_sector:
                 continue
@@ -169,12 +248,15 @@ def build_email(hits: list[dict]) -> MIMEMultipart:
             )
             for h in sorted(by_sector[sector],
                             key=lambda x: -x["breakout_pct"]):
+                if img_idx >= MAX_CHARTS:
+                    overflow.append(h)
+                    continue
                 cid = f"chart{img_idx}"
                 img_idx += 1
                 parts.append(
                     f"<p style='margin:14px 0 2px;font-size:16px;'>"
                     f"<b>{h['ticker']}</b> &nbsp;&middot;&nbsp; "
-                    f"{h.get('name', h['ticker'])}</p>"
+                    f"{h['name']}</p>"
                     f"<p style='margin:0 0 4px;color:#444;'>"
                     f"${h['close']:,.2f} &nbsp;|&nbsp; "
                     f"prior 3y high ${h['prior_3y_high']:,.2f} &nbsp;|&nbsp; "
@@ -184,16 +266,26 @@ def build_email(hits: list[dict]) -> MIMEMultipart:
                 )
                 images.append((cid, make_chart_png(h)))
 
+        if overflow:
+            rows = "".join(
+                f"<li>{h['ticker']} &middot; {h['name']} "
+                f"({h['sector']}, {h['breakout_pct']:+.2f}%)</li>"
+                for h in overflow
+            )
+            parts.append(
+                f"<h3>Also broke out (chart cap of {MAX_CHARTS} "
+                f"reached)</h3><ul>{rows}</ul>"
+            )
+
     parts.append("</body></html>")
     msg.attach(MIMEText("".join(parts), "html"))
 
-    if hits:
-        for cid, png in images:
-            img = MIMEImage(png, _subtype="png")
-            img.add_header("Content-ID", f"<{cid}>")
-            img.add_header("Content-Disposition", "inline",
-                           filename=f"{cid}.png")
-            msg.attach(img)
+    for cid, png in images:
+        img = MIMEImage(png, _subtype="png")
+        img.add_header("Content-ID", f"<{cid}>")
+        img.add_header("Content-Disposition", "inline",
+                       filename=f"{cid}.png")
+        msg.attach(img)
     return msg
 
 
@@ -206,9 +298,14 @@ def send(msg: MIMEMultipart) -> None:
 
 # ---------------------------------------------------------------------------
 def main() -> None:
-    tickers = sorted({t for lst in SECTORS.values() for t in lst})
-    px = yf.download(tickers, period="6y", auto_adjust=True, progress=False)
-    hits = find_breakouts(px, tickers)
+    universe = build_universe()
+    if not universe:
+        print("Universe came back empty — screener may be rate-limited. "
+              "Aborting without email.")
+        return
+
+    closes, highs = download_prices(sorted(universe))
+    hits = find_breakouts(closes, highs, universe)
 
     if not hits and not SEND_IF_EMPTY:
         print("No breakouts — no email sent.")
