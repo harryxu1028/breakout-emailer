@@ -1,0 +1,30 @@
+name: Breakout Emailer
+
+on:
+  schedule:
+    # 11:30 UTC = 7:30am ET during daylight saving (6:30am in winter).
+    # Adjust to '30 12 * * 1-5' after clocks fall back if timing matters.
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch: {}   # allows manual runs from the Actions tab
+
+jobs:
+  scan-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas matplotlib
+
+      - name: Run breakout scan and email
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python breakout_emailer.py
