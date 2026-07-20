@@ -11,7 +11,7 @@ Sends nothing if there are no breakouts.
 
 Env vars required:
   EMAIL_FROM          sender address (e.g. yourname@gmail.com)
-  EMAIL_TO            recipient address
+  EMAIL_TO            recipient addressexa
   GMAIL_APP_PASSWORD  Gmail app password
 
 Usage:
