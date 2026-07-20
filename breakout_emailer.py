@@ -45,16 +45,15 @@ from yfinance import EquityQuery
 SECTORS = [
     "Technology",
     "Financial Services",
-    "Communication Services",
-    "Consumer Cyclical",
+    "Consumer Cyclical","Industrials","Energy","Real Estate"
 ]
 
 REGION = "us"                    # listing region filter
-MIN_MARKET_CAP = 300_000_000     # $300M floor; set to 0 for truly everything
+MIN_MARKET_CAP = 700_000_000     # $700M floor; set to 0 for truly everything
 MAX_NAMES_PER_SECTOR = 2000      # hard safety cap per sector
 
 LOOKBACK = 756                   # ~3 years of trading days for the high test
-MIN_HISTORY = 600                # min trading days to qualify
+MIN_HISTORY = 252                # min trading days to qualify
 CHART_YEARS = 5                  # chart window (full history if shorter)
 USE_INTRADAY_HIGH = False        # True = test against 3y max of daily HIGHS
 SEND_IF_EMPTY = False            # True = send a "no breakouts" email anyway
