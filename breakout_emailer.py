@@ -53,6 +53,11 @@ REGION = "us"                    # listing region filter
 MIN_MARKET_CAP = 300_000_000     # $300M floor; set to 0 for truly everything
 MAX_NAMES_PER_SECTOR = 2000      # hard safety cap per sector
 
+# Sector ETF dashboard: a 1-year chart for each is appended to every
+# email. Tickers with no Yahoo data are silently skipped.
+ETF_TICKERS = ["SOXX", "IGV", "IHAK", "IDGT", "IYF", "KRE", "IAI",
+               "IYJ", "ITA", "IYT", "IFRA", "IYC", "ITB", "IYH", "POWR"]
+
 LOOKBACK = 756                   # ~3 years of trading days for the high test
 MIN_HISTORY = 600                # min trading days to qualify
 CHART_YEARS = 5                  # chart window (full history if shorter)
@@ -107,6 +112,8 @@ def build_universe() -> dict[str, dict]:
                 sym = q.get("symbol")
                 if not sym or "." in sym or "^" in sym:
                     continue  # skip odd share classes / indices
+                if q.get("quoteType") != "EQUITY":
+                    continue  # single stocks only — no mutual funds/ETFs
                 universe.setdefault(sym, {
                     "sector": sector,
                     "name": q.get("shortName")
@@ -217,9 +224,63 @@ def make_chart_png(hit: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# ETF dashboard: fixed list, 1-year charts
+# ---------------------------------------------------------------------------
+def get_etf_sections() -> list[dict]:
+    """1y data for the ETF dashboard; skips tickers Yahoo lacks."""
+    if not ETF_TICKERS:
+        return []
+    try:
+        px = yf.download(ETF_TICKERS, period="1y", auto_adjust=True,
+                         progress=False)
+    except Exception as e:
+        print(f"[warn] ETF download failed: {e}")
+        return []
+    closes = px["Close"]
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(ETF_TICKERS[0])
+
+    out = []
+    for t in ETF_TICKERS:  # preserve config order
+        if t not in closes.columns:
+            continue
+        s = closes[t].dropna()
+        if len(s) < 30:
+            continue  # not on Yahoo / insufficient history
+        try:
+            info = yf.Ticker(t).info
+            name = info.get("shortName") or info.get("longName") or t
+        except Exception:
+            name = t
+        out.append({
+            "ticker": t, "name": name, "series": s,
+            "ret_1y": (s.iloc[-1] / s.iloc[0] - 1) * 100,
+        })
+    return out
+
+
+def make_etf_chart_png(etf: dict) -> bytes:
+    s = etf["series"]
+    fig, ax = plt.subplots(figsize=(7.2, 2.6), dpi=110)
+    color = "#1a7a3a" if s.iloc[-1] >= s.iloc[0] else "#c0392b"
+    ax.plot(s.index, s.values, linewidth=1.4, color=color)
+    ax.set_title(f"{etf['ticker']}  —  1y return {etf['ret_1y']:+.1f}%",
+                 fontsize=10, loc="left")
+    ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("${x:,.0f}"))
+    ax.grid(alpha=0.25, linewidth=0.5)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Email assembly
 # ---------------------------------------------------------------------------
-def build_email(hits: list[dict]) -> MIMEMultipart:
+def build_email(hits: list[dict], etfs: list[dict]) -> MIMEMultipart:
     date_str = hits[0]["date"] if hits else \
         pd.Timestamp.today().date().isoformat()
     msg = MIMEMultipart("related")
@@ -285,6 +346,21 @@ def build_email(hits: list[dict]) -> MIMEMultipart:
                 f"reached)</h3><ul>{rows}</ul>"
             )
 
+    if etfs:
+        parts.append(
+            "<h2 style='margin-top:28px;border-top:2px solid #ddd;"
+            "padding-top:14px;'>Sector ETFs &mdash; trailing 1 year</h2>"
+        )
+        for i, e in enumerate(etfs):
+            cid = f"etf{i}"
+            parts.append(
+                f"<p style='margin:14px 0 2px;font-size:16px;'>"
+                f"<b>{e['ticker']}</b> &nbsp;&middot;&nbsp; {e['name']}</p>"
+                f"<img src='cid:{cid}' width='620' "
+                f"style='display:block;margin-bottom:14px;'>"
+            )
+            images.append((cid, make_etf_chart_png(e)))
+
     parts.append("</body></html>")
     msg.attach(MIMEText("".join(parts), "html"))
 
@@ -319,7 +395,9 @@ def main() -> None:
         print("No breakouts — no email sent.")
         return
 
-    send(build_email(hits))
+    etfs = get_etf_sections()
+    print(f"ETF dashboard: {len(etfs)}/{len(ETF_TICKERS)} tickers found")
+    send(build_email(hits, etfs))
     print(f"Email sent: {len(hits)} breakout(s) — "
           + ", ".join(h["ticker"] for h in hits))
 
