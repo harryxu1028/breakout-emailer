@@ -155,11 +155,14 @@ def find_breakouts(closes: pd.DataFrame, highs: pd.DataFrame,
                    universe: dict[str, dict]) -> list[dict]:
     ref_df = highs if USE_INTRADAY_HIGH else closes
 
-    # If run during market hours, Yahoo may include a partial row for
-    # today's in-progress session — drop it so the test always uses the
-    # last COMPLETED trading day.
-    today = pd.Timestamp.now(tz="America/New_York").date()
-    if len(closes) and closes.index[-1].date() >= today:
+    # A row dated today is only a COMPLETED close if the market has
+    # closed (>= ~4:05pm ET). Before that, drop it and scan the prior
+    # trading day; after the close, keep it so a 4:30pm run scans
+    # today's close.
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    market_closed = (now_et.hour, now_et.minute) >= (16, 5)
+    if (len(closes) and closes.index[-1].date() >= now_et.date()
+            and not market_closed):
         closes, ref_df = closes.iloc[:-1], ref_df.iloc[:-1]
 
     hits = []
