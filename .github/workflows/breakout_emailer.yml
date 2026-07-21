@@ -2,9 +2,10 @@ name: Breakout Emailer
 
 on:
   schedule:
-    # 11:30 UTC = 7:30am ET during daylight saving (6:30am in winter).
-    # Adjust to '30 12 * * 1-5' after clocks fall back if timing matters.
-    - cron: '30 11 * * 1-5'
+    # 20:30 UTC = 4:30pm ET during daylight saving (3:30pm in winter —
+    # change to '30 21 * * 1-5' after clocks fall back in November,
+    # otherwise the run lands before the close and scans the prior day).
+    - cron: '30 20 * * 1-5'
   workflow_dispatch: {}   # allows manual runs from the Actions tab
 
 jobs:
